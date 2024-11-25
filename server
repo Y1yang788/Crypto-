@@ -1,0 +1,103 @@
+import socket
+import ssl
+import random
+import pickle
+import threading
+import logging
+import time
+import hmac
+import hashlib
+import os
+
+# 设置日志记录
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class GMEncryption:
+    def __init__(self, p, q):
+        self.p = p
+        self.q = q
+        self.n = p * q
+        self.n_squared = self.n * self.n
+
+    def encrypt(self, message):
+        r = random.randint(1, self.n - 1)
+        ciphertext = (pow(r, 2, self.n_squared) * pow(2 if message else 1, self.n, self.n_squared)) % self.n_squared
+        return ciphertext
+
+    def decrypt(self, ciphertext):
+        x = pow(ciphertext, (self.p - 1) * (self.q - 1) // 4, self.n_squared)
+        return 1 if x % self.n == 0 else 0
+
+def generate_hmac(key, message):
+    return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
+
+def handle_client(ssl_conn):
+    p, q = 11, 19  # 示例素数
+    gm_encryption = GMEncryption(p, q)
+    client_address = ssl_conn.getpeername()
+    logging.info(f"处理客户端 {client_address}")
+
+    try:
+        # 握手过程
+        public_key = (p, q)  # 发送素数 p 和 q
+        ssl_conn.sendall(pickle.dumps(public_key))
+
+        # 接收加密的密钥
+        encrypted_key = pickle.loads(ssl_conn.recv(1024))
+        decrypted_key = gm_encryption.decrypt(encrypted_key)
+        logging.info(f"接收到的加密密钥: {encrypted_key}, 解密后的密钥: {decrypted_key}")
+
+        # 生成对称密钥
+        sym_key = os.urandom(32)  # 生成 256 位随机密钥
+
+        # 发送对称密钥给客户端
+        ssl_conn.sendall(sym_key)
+
+        while True:
+            data = ssl_conn.recv(1024)
+            if not data:
+                break
+            
+            message, received_hmac = pickle.loads(data)
+            calculated_hmac = generate_hmac(sym_key, message)
+
+            if hmac.compare_digest(received_hmac, calculated_hmac):
+                logging.info(f"收到的数据: {message}")
+                if message.lower() == 'ping':
+                    response = "pong"
+                elif message.lower() == 'time':
+                    response = f"当前时间: {time.ctime()}"
+                elif message.lower() == 'exit':
+                    logging.info(f"客户端 {client_address} 断开连接")
+                    break
+                else:
+                    response = f"Echo: {message}"
+
+                response_hmac = generate_hmac(sym_key, response)
+                ssl_conn.sendall(pickle.dumps((response, response_hmac)))
+            else:
+                logging.warning("HMAC 校验失败，消息可能被篡改！")
+                
+    except Exception as e:
+        logging.error(f"处理客户端时出错: {e}")
+    finally:
+        ssl_conn.shutdown(socket.SHUT_RDWR)
+        ssl_conn.close()
+
+def start_server(port):
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind(('localhost', port))
+    server_socket.listen(5)
+    logging.info("服务器正在运行，等待连接...")
+
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(certfile='server.crt', keyfile='server.key')
+
+    while True:
+        conn, addr = server_socket.accept()
+        logging.info(f"客户端 {addr} 已连接")
+        ssl_conn = context.wrap_socket(conn, server_side=True)
+        threading.Thread(target=handle_client, args=(ssl_conn,)).start()
+
+if __name__ == "__main__":
+    start_server(8080)
