@@ -1,0 +1,90 @@
+import socket
+import ssl
+import random
+import pickle
+import hmac
+import hashlib
+import os
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+
+class GMEncryption:
+    def __init__(self, p, q):
+        self.p = p
+        self.q = q
+        self.n = p * q
+        self.n_squared = self.n * self.n
+
+    def encrypt(self, message):
+        r = random.randint(1, self.n - 1)
+        ciphertext = (pow(r, 2, self.n_squared) * pow(2 if message else 1, self.n, self.n_squared)) % self.n_squared
+        return ciphertext
+
+def generate_hmac(key, message):
+    return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
+
+class ClientApp:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Secure Client")
+
+        self.text_area = scrolledtext.ScrolledText(master, wrap=tk.WORD, width=50, height=20)
+        self.text_area.pack(pady=10)
+
+        self.entry = tk.Entry(master, width=50)
+        self.entry.pack(pady=10)
+        self.entry.bind("<Return>", self.send_message)
+
+        self.connect_to_server()
+
+    def connect_to_server(self):
+        self.p, self.q = 11, 19  # 示例素数
+        self.gm_encryption = GMEncryption(self.p, self.q)
+
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        self.ssl_sock = context.wrap_socket(self.client_socket, server_hostname='localhost')
+        self.ssl_sock.connect(('localhost', 8080))
+
+        # 握手过程
+        public_key = pickle.loads(self.ssl_sock.recv(1024))
+        self.text_area.insert(tk.END, f"接收到的公钥: {public_key}\n")
+
+        # 使用公钥加密密钥
+        encrypted_key = self.gm_encryption.encrypt(1)
+        self.ssl_sock.sendall(pickle.dumps(encrypted_key))
+
+        # 接收对称密钥
+        self.sym_key = self.ssl_sock.recv(32)  # 接收 256 位随机密钥
+
+        self.text_area.insert(tk.END, "连接成功，开始聊天...\n")
+
+    def send_message(self, event=None):
+        message = self.entry.get()
+        if message.lower() == 'exit':
+            self.ssl_sock.sendall(pickle.dumps((message, generate_hmac(self.sym_key, message))))
+            self.ssl_sock.shutdown(socket.SHUT_RDWR)
+            self.ssl_sock.close()
+            self.master.quit()
+            return
+
+        message_hmac = generate_hmac(self.sym_key, message)
+        self.ssl_sock.sendall(pickle.dumps((message, message_hmac)))
+
+        response_data = self.ssl_sock.recv(1024)
+        response, response_hmac = pickle.loads(response_data)
+
+        if hmac.compare_digest(response_hmac, generate_hmac(self.sym_key, response)):
+            self.text_area.insert(tk.END, f"服务器响应: {response}\n")
+        else:
+            messagebox.showwarning("警告", "响应的 HMAC 校验失败！")
+
+        self.entry.delete(0, tk.END)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ClientApp(root)
+    root.mainloop()
